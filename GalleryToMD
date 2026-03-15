@@ -1,0 +1,681 @@
+#!/usr/bin/env python3
+“””
+gallery_to_md.py — LLM Architecture Gallery → Structured Markdown/JSON
+
+Fetches Sebastian Raschka’s LLM Architecture Gallery and converts it into
+a clean, machine-readable “pool of ideas” for autoresearch agents.
+
+Inspired by Andrej Karpathy’s request (March 15, 2026):
+“Nice! My autoresearch would love some markdown version of this - pool of ideas.”
+
+Usage:
+python gallery_to_md.py –output llm_ideas_pool.md
+python gallery_to_md.py –output pool.md –json pool.json –force-refresh
+python gallery_to_md.py –diff  # compare against last cached version
+
+Author: AIHacksByMK
+License: MIT
+“””
+
+import argparse
+import hashlib
+import json
+import logging
+import os
+import re
+import sys
+import time
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+import requests
+import yaml
+from bs4 import BeautifulSoup, Tag
+
+# —————————————————————————
+
+# Configuration
+
+# —————————————————————————
+
+GALLERY_URL = “https://sebastianraschka.com/llm-architecture-gallery/”
+USER_AGENT = (
+“gallery_to_md/1.0 (autoresearch pool-of-ideas builder; “
+“+https://github.com/karpathy/autoresearch) Python/requests”
+)
+CACHE_DIR = Path(”.gallery_cache”)
+CACHE_HTML = CACHE_DIR / “gallery.html”
+CACHE_META = CACHE_DIR / “meta.json”
+REQUEST_TIMEOUT = 30
+POLITE_DELAY = 1.0  # seconds between requests
+
+logging.basicConfig(
+level=logging.INFO,
+format=”%(asctime)s [%(levelname)s] %(message)s”,
+datefmt=”%Y-%m-%d %H:%M:%S”,
+)
+log = logging.getLogger(“gallery_to_md”)
+
+# —————————————————————————
+
+# Data classes
+
+# —————————————————————————
+
+@dataclass
+class ModelEntry:
+“”“Represents one model card from the gallery.”””
+name: str
+summary: str = “”
+scale: str = “”
+date: str = “”
+decoder_type: str = “”
+attention: str = “”
+key_detail: str = “”
+related_concepts: list[str] = field(default_factory=list)
+diagram_url: str = “”
+diagram_alt: str = “”
+article_url: str = “”
+from_scratch_url: str = “”
+config_json_url: str = “”
+tech_report_url: str = “”
+section_id: str = “”
+
+```
+def to_dict(self) -> dict:
+    return {k: v for k, v in asdict(self).items() if v}
+```
+
+@dataclass
+class GalleryData:
+“”“Top-level container for the entire gallery.”””
+source_url: str = GALLERY_URL
+fetched_at: str = “”
+models: list[ModelEntry] = field(default_factory=list)
+upcoming_models: list[str] = field(default_factory=list)
+source_articles: list[dict] = field(default_factory=list)
+
+```
+def to_dict(self) -> dict:
+    return {
+        "source_url": self.source_url,
+        "fetched_at": self.fetched_at,
+        "model_count": len(self.models),
+        "models": [m.to_dict() for m in self.models],
+        "upcoming_models": self.upcoming_models,
+        "source_articles": self.source_articles,
+    }
+```
+
+# —————————————————————————
+
+# Fetching
+
+# —————————————————————————
+
+def fetch_gallery(force_refresh: bool = False) -> str:
+“”“Fetch the gallery HTML, with optional caching.”””
+CACHE_DIR.mkdir(exist_ok=True)
+
+```
+if not force_refresh and CACHE_HTML.exists():
+    age_hours = (time.time() - CACHE_HTML.stat().st_mtime) / 3600
+    if age_hours < 24:
+        log.info(f"Using cached HTML (age: {age_hours:.1f}h)")
+        return CACHE_HTML.read_text(encoding="utf-8")
+    else:
+        log.info(f"Cache is {age_hours:.1f}h old, refreshing...")
+
+log.info(f"Fetching {GALLERY_URL}")
+headers = {"User-Agent": USER_AGENT}
+try:
+    resp = requests.get(GALLERY_URL, headers=headers, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+except requests.RequestException as e:
+    if CACHE_HTML.exists():
+        log.warning(f"Fetch failed ({e}), falling back to cache")
+        return CACHE_HTML.read_text(encoding="utf-8")
+    log.error(f"Fetch failed and no cache available: {e}")
+    sys.exit(1)
+
+html = resp.text
+CACHE_HTML.write_text(html, encoding="utf-8")
+
+# Save metadata
+meta = {
+    "fetched_at": datetime.now(timezone.utc).isoformat(),
+    "url": GALLERY_URL,
+    "status_code": resp.status_code,
+    "content_length": len(html),
+    "content_hash": hashlib.sha256(html.encode()).hexdigest()[:16],
+}
+CACHE_META.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+log.info(f"Fetched {len(html):,} bytes, cached to {CACHE_HTML}")
+
+time.sleep(POLITE_DELAY)
+return html
+```
+
+# —————————————————————————
+
+# Parsing
+
+# —————————————————————————
+
+def parse_gallery(html: str) -> GalleryData:
+“”“Parse the gallery HTML into structured data.”””
+soup = BeautifulSoup(html, “html.parser”)
+gallery = GalleryData(
+fetched_at=datetime.now(timezone.utc).strftime(”%Y-%m-%d %H:%M UTC”),
+)
+
+```
+# The gallery uses a BEM structure:
+#   <article class="llm-architecture-overview__card">
+#     <img ...>  (diagram)
+#     <span class="llm-architecture-overview__body">
+#       <div class="__title-row"> → <h3>, links
+#       <div class="__fact-sheet"> → <p> summary, <dl> specs, concepts
+cards = soup.find_all("article", class_="llm-architecture-overview__card")
+log.info(f"Found {len(cards)} model card(s)")
+
+for card in cards:
+    model = parse_model_card(card)
+    if model and model.name:
+        gallery.models.append(model)
+
+# Fallback: if no BEM cards found, try the h3-based approach
+if not gallery.models:
+    log.warning("No BEM cards found, falling back to h3-based parsing")
+    for h3 in soup.find_all("h3"):
+        model = parse_model_entry_fallback(h3)
+        if model and model.name:
+            gallery.models.append(model)
+
+# Extract upcoming models from the nav/toc links at the top
+nav_links = soup.find_all("a", href=re.compile(r"#section-"))
+for link in nav_links:
+    name = link.get_text(strip=True)
+    existing_names = {m.name.lower() for m in gallery.models}
+    if name.lower() not in existing_names and name:
+        gallery.upcoming_models.append(name)
+
+# Extract source articles
+for h2 in soup.find_all("h2"):
+    text = h2.get_text(strip=True)
+    if "Architecture Comparison" in text or "Dream of Spring" in text:
+        link = h2.find("a")
+        if link:
+            gallery.source_articles.append({
+                "title": text,
+                "url": link.get("href", ""),
+            })
+
+log.info(
+    f"Parsed {len(gallery.models)} models, "
+    f"{len(gallery.upcoming_models)} upcoming, "
+    f"{len(gallery.source_articles)} source articles"
+)
+return gallery
+```
+
+def parse_model_card(card: Tag) -> Optional[ModelEntry]:
+“”“Parse a single model card from an <article> BEM element.”””
+# Model name from h3
+h3 = card.find(“h3”, class_=“llm-architecture-overview__title”)
+if not h3:
+return None
+name = h3.get_text(strip=True)
+if not name:
+return None
+
+```
+model = ModelEntry(name=name)
+
+# Section ID from the card
+model.section_id = card.get("id", "")
+
+# Diagram image (direct child <img> of the card, before the body)
+img = card.find("img")
+if img:
+    src = img.get("src", "")
+    if src and not src.startswith("http"):
+        src = f"https://sebastianraschka.com{src}"
+    model.diagram_url = src
+    model.diagram_alt = img.get("alt", "")
+
+# Links from the title-meta section
+meta_div = card.find("div", class_="llm-architecture-overview__title-meta")
+if meta_div:
+    for link in meta_div.find_all("a"):
+        href = link.get("href", "")
+        text = link.get_text(strip=True)
+        if "View in article" in text:
+            model.article_url = href
+        elif "From scratch" in text:
+            model.from_scratch_url = href
+        elif "config.json" in text or "params.json" in text:
+            model.config_json_url = href
+        elif "Tech report" in text:
+            model.tech_report_url = href
+
+# Summary paragraph
+summary_p = card.find("p", class_="llm-architecture-overview__fact-summary")
+if summary_p:
+    model.summary = summary_p.get_text(strip=True)
+
+# Fact grid: <dl> with <dt>/<dd> pairs wrapped in <div> items
+fact_grid = card.find("dl", class_="llm-architecture-overview__fact-grid")
+if fact_grid:
+    items = fact_grid.find_all("div", class_="llm-architecture-overview__fact-item") or []
+    # Also try direct dt/dd pairs
+    if not items:
+        dts = fact_grid.find_all("dt")
+        dds = fact_grid.find_all("dd")
+        for dt, dd in zip(dts, dds):
+            _assign_fact(model, dt.get_text(strip=True), dd.get_text(strip=True))
+    else:
+        for item in items:
+            dt = item.find("dt")
+            dd = item.find("dd")
+            if dt and dd:
+                _assign_fact(model, dt.get_text(strip=True), dd.get_text(strip=True))
+
+# Related concepts
+concepts_div = card.find("div", class_="llm-architecture-overview__concepts-links")
+if concepts_div:
+    for link in concepts_div.find_all("a"):
+        concept = link.get_text(strip=True)
+        if concept and concept not in model.related_concepts:
+            model.related_concepts.append(concept)
+
+return model
+```
+
+def _assign_fact(model: ModelEntry, key: str, val: str) -> None:
+“”“Assign a fact-grid key/value pair to the appropriate model field.”””
+k = key.lower()
+if “scale” in k:
+model.scale = val
+elif “date” in k:
+model.date = val
+elif “decoder” in k:
+model.decoder_type = val
+elif “attention” in k:
+model.attention = val
+elif “key detail” in k:
+model.key_detail = val
+
+def parse_model_entry_fallback(h3: Tag) -> Optional[ModelEntry]:
+“”“Fallback parser for pages without BEM class structure.”””
+name = h3.get_text(strip=True)
+if not name or name.startswith(“©”):
+return None
+model = ModelEntry(name=name)
+
+```
+prev_img = h3.find_previous("img")
+if prev_img:
+    src = prev_img.get("src", "")
+    if "architectures/" in src:
+        if not src.startswith("http"):
+            src = f"https://sebastianraschka.com{src}"
+        model.diagram_url = src
+        model.diagram_alt = prev_img.get("alt", "")
+
+for sib in h3.find_next_siblings():
+    if sib.name in ("h3", "h2"):
+        break
+    if not isinstance(sib, Tag):
+        continue
+    for link in sib.find_all("a"):
+        href = link.get("href", "")
+        text = link.get_text(strip=True)
+        if "View in article" in text:
+            model.article_url = href
+        elif "From scratch" in text:
+            model.from_scratch_url = href
+        elif "config.json" in text:
+            model.config_json_url = href
+        elif "Tech report" in text:
+            model.tech_report_url = href
+
+    for dl in ([sib] if sib.name == "dl" else sib.find_all("dl")):
+        for dt, dd in zip(dl.find_all("dt"), dl.find_all("dd")):
+            _assign_fact(model, dt.get_text(strip=True), dd.get_text(strip=True))
+
+return model
+```
+
+# —————————————————————————
+
+# Markdown generation
+
+# —————————————————————————
+
+def generate_markdown(gallery: GalleryData) -> str:
+“”“Generate clean, structured Markdown from the gallery data.”””
+lines = []
+w = lines.append  # shorthand
+
+```
+w("# LLM Architecture Gallery — Machine-Readable Pool of Ideas")
+w("")
+w("## Metadata")
+w("")
+w(f"- **Source**: <{gallery.source_url}>")
+w(f"- **Last fetched**: {gallery.fetched_at}")
+w(f"- **Maintained by**: Sebastian Raschka")
+w(f"- **Total models**: {len(gallery.models)}")
+w(f"- **Purpose** (per Karpathy): Pool of architecture ideas for autoresearch agents")
+w("")
+
+if gallery.source_articles:
+    w("### Source Articles")
+    w("")
+    for art in gallery.source_articles:
+        w(f"- [{art['title']}]({art['url']})")
+    w("")
+
+w("---")
+w("")
+w("## Models")
+w("")
+
+# Group models by decoder type for easier browsing
+dense = [m for m in gallery.models if "dense" in m.decoder_type.lower()]
+moe = [m for m in gallery.models if "moe" in m.decoder_type.lower() and "hybrid" not in m.decoder_type.lower()]
+hybrid = [m for m in gallery.models if "hybrid" in m.decoder_type.lower()]
+other = [m for m in gallery.models if m not in dense and m not in moe and m not in hybrid]
+
+# Quick index
+w("### Quick Index by Architecture Type")
+w("")
+if dense:
+    w(f"**Dense** ({len(dense)}): " + ", ".join(f"[{m.name}](#{slugify(m.name)})" for m in dense))
+if moe:
+    w(f"**Sparse MoE** ({len(moe)}): " + ", ".join(f"[{m.name}](#{slugify(m.name)})" for m in moe))
+if hybrid:
+    w(f"**Hybrid** ({len(hybrid)}): " + ", ".join(f"[{m.name}](#{slugify(m.name)})" for m in hybrid))
+if other:
+    w(f"**Other** ({len(other)}): " + ", ".join(f"[{m.name}](#{slugify(m.name)})" for m in other))
+w("")
+w("---")
+w("")
+
+# Render each model
+for i, model in enumerate(gallery.models, 1):
+    w(f"### {model.name}")
+    w("")
+
+    if model.summary:
+        w(f"> {model.summary}")
+        w("")
+
+    # Structured specs table
+    specs = []
+    if model.scale:
+        specs.append(("Scale", model.scale))
+    if model.date:
+        specs.append(("Release date", model.date))
+    if model.decoder_type:
+        specs.append(("Decoder type", model.decoder_type))
+    if model.attention:
+        specs.append(("Attention", model.attention))
+    if model.key_detail:
+        specs.append(("Key detail", model.key_detail))
+
+    if specs:
+        w("| Property | Value |")
+        w("|----------|-------|")
+        for key, val in specs:
+            w(f"| {key} | {val} |")
+        w("")
+
+    # Related concepts as tags
+    if model.related_concepts:
+        w(f"**Related concepts**: {', '.join(model.related_concepts)}")
+        w("")
+
+    # Links
+    links = []
+    if model.config_json_url:
+        links.append(f"[config.json]({model.config_json_url})")
+    if model.tech_report_url:
+        links.append(f"[Tech report]({model.tech_report_url})")
+    if model.article_url:
+        links.append(f"[Article section]({model.article_url})")
+    if model.from_scratch_url:
+        links.append(f"[From scratch]({model.from_scratch_url})")
+    if links:
+        w(f"**Links**: {' · '.join(links)}")
+        w("")
+
+    # Diagram
+    if model.diagram_url:
+        alt = model.diagram_alt or f"{model.name} architecture diagram"
+        w(f"**Diagram**: ![{alt}]({model.diagram_url})")
+        w("")
+
+    w("---")
+    w("")
+
+# Upcoming / announced models
+if gallery.upcoming_models:
+    w("## Upcoming / Announced Models")
+    w("")
+    w("The following models appear in the gallery navigation but do not yet have")
+    w("full architecture cards:")
+    w("")
+    for name in gallery.upcoming_models:
+        w(f"- {name}")
+    w("")
+
+# Appendix: Cross-reference tables
+w("## Appendix: Architecture Feature Matrix")
+w("")
+w("A quick-scan matrix for autoresearch agents to compare design choices at a glance.")
+w("")
+w("| Model | Scale | Type | Attention | Key Innovation |")
+w("|-------|-------|------|-----------|----------------|")
+for m in gallery.models:
+    scale = m.scale.replace("|", "/")
+    attn = m.attention.replace("|", "/")
+    key = m.key_detail[:80].replace("|", "/") if m.key_detail else "—"
+    w(f"| {m.name} | {scale} | {m.decoder_type} | {attn} | {key} |")
+w("")
+
+# Concept frequency
+w("## Appendix: Concept Frequency")
+w("")
+w("How often each architectural concept appears across the gallery, useful for")
+w("identifying dominant and emerging patterns.")
+w("")
+concept_count: dict[str, int] = {}
+for m in gallery.models:
+    for c in m.related_concepts:
+        concept_count[c] = concept_count.get(c, 0) + 1
+for concept, count in sorted(concept_count.items(), key=lambda x: -x[1]):
+    bar = "█" * count
+    w(f"- **{concept}**: {count} {bar}")
+w("")
+
+# Footer
+w("---")
+w("")
+w("*Generated by `gallery_to_md.py` for use with autoresearch agents.*")
+w(f"*Fetched: {gallery.fetched_at} · Models: {len(gallery.models)}*")
+
+return "\n".join(lines)
+```
+
+def slugify(text: str) -> str:
+“”“Create a Markdown-compatible anchor slug.”””
+slug = text.lower()
+slug = re.sub(r”[^a-z0-9\s-]”, “”, slug)
+slug = re.sub(r”[\s]+”, “-”, slug)
+return slug.strip(”-”)
+
+# —————————————————————————
+
+# JSON / YAML export
+
+# —————————————————————————
+
+def export_json(gallery: GalleryData, path: Path) -> None:
+“”“Export gallery data as JSON.”””
+data = gallery.to_dict()
+path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding=“utf-8”)
+log.info(f”JSON exported to {path}”)
+
+def export_yaml(gallery: GalleryData, path: Path) -> None:
+“”“Export gallery data as YAML.”””
+data = gallery.to_dict()
+path.write_text(
+yaml.dump(data, default_flow_style=False, allow_unicode=True, sort_keys=False),
+encoding=“utf-8”,
+)
+log.info(f”YAML exported to {path}”)
+
+# —————————————————————————
+
+# Diff support
+
+# —————————————————————————
+
+def diff_galleries(old_path: Path, new_md: str) -> str:
+“”“Compare new markdown against a previously saved version.”””
+if not old_path.exists():
+return “No previous version found — nothing to diff.”
+
+```
+old_lines = old_path.read_text(encoding="utf-8").splitlines()
+new_lines = new_md.splitlines()
+
+# Simple diff: find added/removed model names
+old_models = {l.strip("# ").strip() for l in old_lines if l.startswith("### ")}
+new_models = {l.strip("# ").strip() for l in new_lines if l.startswith("### ")}
+
+added = new_models - old_models
+removed = old_models - new_models
+
+parts = []
+if added:
+    parts.append(f"NEW models ({len(added)}): {', '.join(sorted(added))}")
+if removed:
+    parts.append(f"REMOVED models ({len(removed)}): {', '.join(sorted(removed))}")
+if not parts:
+    parts.append("No model-level changes detected.")
+
+return "\n".join(parts)
+```
+
+# —————————————————————————
+
+# CLI
+
+# —————————————————————————
+
+def main():
+parser = argparse.ArgumentParser(
+description=(
+“Convert Sebastian Raschka’s LLM Architecture Gallery into “
+“structured Markdown for autoresearch agents.”
+),
+formatter_class=argparse.RawDescriptionHelpFormatter,
+epilog=(
+“Examples:\n”
+“  python gallery_to_md.py –output pool.md\n”
+“  python gallery_to_md.py –output pool.md –json pool.json –force-refresh\n”
+“  python gallery_to_md.py –output pool.md –yaml pool.yaml\n”
+“  python gallery_to_md.py –diff\n”
+),
+)
+parser.add_argument(
+“–output”, “-o”,
+type=Path,
+default=Path(“llm_ideas_pool.md”),
+help=“Output Markdown file (default: llm_ideas_pool.md)”,
+)
+parser.add_argument(
+“–json”, “-j”,
+type=Path,
+default=None,
+help=“Also export as JSON”,
+)
+parser.add_argument(
+“–yaml”, “-y”,
+type=Path,
+default=None,
+help=“Also export as YAML”,
+)
+parser.add_argument(
+“–force-refresh”, “-f”,
+action=“store_true”,
+help=“Ignore cache and re-fetch from the web”,
+)
+parser.add_argument(
+“–diff”, “-d”,
+action=“store_true”,
+help=“Show changes since last generated version”,
+)
+parser.add_argument(
+“–quiet”, “-q”,
+action=“store_true”,
+help=“Suppress info-level logging”,
+)
+
+```
+args = parser.parse_args()
+
+if args.quiet:
+    logging.getLogger("gallery_to_md").setLevel(logging.WARNING)
+
+# Fetch and parse
+html = fetch_gallery(force_refresh=args.force_refresh)
+gallery = parse_gallery(html)
+
+if not gallery.models:
+    log.error("No models parsed — the page structure may have changed.")
+    log.error("Try running with --force-refresh or check the gallery URL.")
+    sys.exit(1)
+
+# Generate markdown
+md = generate_markdown(gallery)
+
+# Diff mode
+if args.diff:
+    diff_result = diff_galleries(args.output, md)
+    print("\n=== Gallery Diff ===")
+    print(diff_result)
+    print()
+
+# Write outputs
+args.output.write_text(md, encoding="utf-8")
+log.info(f"Markdown written to {args.output} ({len(md):,} chars, {len(gallery.models)} models)")
+
+if args.json:
+    export_json(gallery, args.json)
+
+if args.yaml:
+    export_yaml(gallery, args.yaml)
+
+# Print summary
+print(f"\n{'='*60}")
+print(f"  LLM Architecture Gallery → Pool of Ideas")
+print(f"{'='*60}")
+print(f"  Models parsed:   {len(gallery.models)}")
+print(f"  Upcoming:        {len(gallery.upcoming_models)}")
+print(f"  Output:          {args.output}")
+if args.json:
+    print(f"  JSON:            {args.json}")
+if args.yaml:
+    print(f"  YAML:            {args.yaml}")
+print(f"  Markdown size:   {len(md):,} characters")
+print(f"{'='*60}\n")
+```
+
+if **name** == “**main**”:
+main()
